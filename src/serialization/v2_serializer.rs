@@ -2,7 +2,7 @@ use super::{V2_COOKIE, V2_HEADER_SIZE};
 use super::super::{Counter, Histogram};
 use std::io::Write;
 use std;
-use super::byteorder::{BigEndian, WriteBytesExt};
+use super::byteorder::{BigEndian, LittleEndian, WriteBytesExt};
 
 /// Errors that occur during serialization.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -132,90 +132,71 @@ pub fn encode_counts<T: Counter>(h: &Histogram<T>, buf: &mut [u8]) -> Result<usi
     Ok(bytes_written)
 }
 
+// lookup table. Row = number of bytes to output, column = byte index in the 9 byte output.
+// No column for the 9th byte since it's just the untouched highest 8 bits of input.
+// The low byte (lexically last) will be first in the output.
+const MARK_BIT_LOOKUP_TABLE: [u64; 9] = [
+    0x00_00_00_00_00_00_00_00,
+    0x00_00_00_00_00_00_00_80,
+    0x00_00_00_00_00_00_80_80,
+    0x00_00_00_00_00_80_80_80,
+    0x00_00_00_00_80_80_80_80,
+    0x00_00_00_80_80_80_80_80,
+    0x00_00_80_80_80_80_80_80,
+    0x00_80_80_80_80_80_80_80,
+    0x80_80_80_80_80_80_80_80,
+];
+
+// Mapping of leading zeros to how many bytes of output there will be
+const OUTPUT_BYTES_LOOKUP_TABLE: [u8; 65] = [
+    // if any of the top 8 bits are set, there will be a full 9th byte
+    9, 9, 9, 9, 9, 9, 9, 9,
+    8, 8, 8, 8, 8, 8, 8,
+    7, 7, 7, 7, 7, 7, 7,
+    6, 6, 6, 6, 6, 6, 6,
+    5, 5, 5, 5, 5, 5, 5,
+    4, 4, 4, 4, 4, 4, 4,
+    3, 3, 3, 3, 3, 3, 3,
+    2, 2, 2, 2, 2, 2, 2,
+    1, 1, 1, 1, 1, 1, 1,
+    // 64 leading zeros still gets 1 byte
+    1
+];
+
+
 /// Write a number as a LEB128-64b9B little endian base 128 varint to buf. This is not
 /// quite the same as Protobuf's LEB128 as it encodes 64 bit values in a max of 9 bytes, not 10.
 /// The first 8 7-bit chunks are encoded normally (up through the first 7 bytes of input). The last
 /// byte is added to the buf as-is. This limits the input to 8 bytes, but that's all we need.
 /// Returns the number of bytes written (in [1, 9]).
 #[inline]
-pub fn varint_write(input: u64, buf: &mut [u8]) -> usize {
-    // The loop is unrolled because the special case is awkward to express in a loop, and it
-    // probably makes the branch predictor happier to do it this way.
-    // This way about twice as fast as the other "obvious" approach: a sequence of `if`s to detect
-    // size directly with each branch encoding that number completely and returning.
+pub fn varint_write(input: u64, mut buf: &mut [u8]) -> usize {
 
-    // TODO try bitwise and instead of shift
-    if (input >> 7) == 0 {
-        buf[0] = input as u8;
-        return 1;
-    } else {
-        // set high bit because more bytes are coming, then next 7 bits of value.
-        buf[0] = 0x80 | ((input & 0x7F) as u8);
-        if (input >> 7 * 2) == 0 {
-            // nothing above bottom 2 chunks, this is the last byte, so no high bit
-            buf[1] = nth_7b_chunk(input, 1);
-            return 2;
-        } else {
-            buf[1] = nth_7b_chunk_with_high_bit(input, 1);
-            if (input >> 7 * 3) == 0 {
-                buf[2] = nth_7b_chunk(input, 2);
-                return 3;
-            } else {
-                buf[2] = nth_7b_chunk_with_high_bit(input, 2);
-                if (input >> 7 * 4) == 0 {
-                    buf[3] = nth_7b_chunk(input, 3);
-                    return 4;
-                } else {
-                    buf[3] = nth_7b_chunk_with_high_bit(input, 3);
-                    if (input >> 7 * 5) == 0 {
-                        buf[4] = nth_7b_chunk(input, 4);
-                        return 5;
-                    } else {
-                        buf[4] = nth_7b_chunk_with_high_bit(input, 4);
-                        if (input >> 7 * 6) == 0 {
-                            buf[5] = nth_7b_chunk(input, 5);
-                            return 6;
-                        } else {
-                            buf[5] = nth_7b_chunk_with_high_bit(input, 5);
-                            if (input >> 7 * 7) == 0 {
-                                buf[6] = nth_7b_chunk(input, 6);
-                                return 7;
-                            } else {
-                                buf[6] = nth_7b_chunk_with_high_bit(input, 6);
-                                if (input >> 7 * 8) == 0 {
-                                    buf[7] = nth_7b_chunk(input, 7);
-                                    return 8;
-                                } else {
-                                    buf[7] = nth_7b_chunk_with_high_bit(input, 7);
-                                    // special case: write last whole byte as is
-                                    buf[8] = (input >> 56) as u8;
-                                    return 9;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+    let leading_zeros = input.leading_zeros();
+    // TODO do arithmetic instead?
+    let bytes_of_output = OUTPUT_BYTES_LOOKUP_TABLE[leading_zeros as usize] as usize;
+    let mark_bits = MARK_BIT_LOOKUP_TABLE[bytes_of_output - 1];
 
-/// input: a u64
-/// n: >0, how many 7-bit shifts to do
-/// Returns the n'th chunk (starting from least significant) of 7 bits as a byte with the the high
-/// bit unchanged.
-#[inline]
-fn nth_7b_chunk(input: u64, n: u8) -> u8 {
-    (input >> 7 * n) as u8
-}
+    let first_8_bytes: u64 =
+        (input & 0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_01111111) |
+            ((input & 0b00000000_00000000_00000000_00000000_00000000_00000000_00111111_10000000) << 1) |
+            ((input & 0b00000000_00000000_00000000_00000000_00000000_00011111_11000000_00000000) << 2) |
+            ((input & 0b00000000_00000000_00000000_00000000_00001111_11100000_00000000_00000000) << 3) |
+            ((input & 0b00000000_00000000_00000000_00000111_11110000_00000000_00000000_00000000) << 4) |
+            ((input & 0b00000000_00000000_00000011_11111000_00000000_00000000_00000000_00000000) << 5) |
+            ((input & 0b00000000_00000001_11111100_00000000_00000000_00000000_00000000_00000000) << 6) |
+            ((input & 0b00000000_11111110_00000000_00000000_00000000_00000000_00000000_00000000) << 7) |
+            mark_bits;
 
-/// input: a u64
-/// n: >0, how many 7-bit shifts to do
-/// Returns the n'th chunk (starting from least significant) of 7 bits as a byte.
-/// The high bit in the byte will be set (not one of the 7 bits that map to input bits).
-#[inline]
-fn nth_7b_chunk_with_high_bit(input: u64, n: u8) -> u8 {
-    nth_7b_chunk(input, n) | 0x80
+//    println!("buf len: {}, bytes: {}, mark: 0x{:016X}, first 8: 0x{:016X}, input: 0x{:016X}",
+//             buf.len(), bytes_of_output, mark_bits, first_8_bytes, input);
+
+    // least significant byte goes first
+    buf.write_u64::<LittleEndian>(first_8_bytes).unwrap();
+    // buf has advanced, the next byte is the high one
+    buf[0] = (input >> 56) as u8;
+
+    return bytes_of_output;
 }
 
 /// Map signed numbers to unsigned: 0 to 0, -1 to 1, 1 to 2, -2 to 3, etc
