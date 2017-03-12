@@ -155,7 +155,9 @@ fn encode_counts_all_zeros() {
     assert_eq!(0, vec[0]);
 
     let mut cursor = Cursor::new(vec);
-    assert_eq!(0, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (decoded, bytes_read) = varint_read(&mut cursor).unwrap();
+    assert_eq!(1, bytes_read);
+    assert_eq!(0, zig_zag_decode(decoded));
 }
 
 #[test]
@@ -174,11 +176,15 @@ fn encode_counts_last_count_incremented() {
 
     let mut cursor = Cursor::new(vec);
     // 2047 zeroes. 2047 is 11 bits, so 2 7-byte chunks.
-    assert_eq!(-2047, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (num0, bytes0) = varint_read(&mut cursor).unwrap();
+    assert_eq!(-2047, zig_zag_decode(num0));
+    assert_eq!(2, bytes0);
     assert_eq!(2, cursor.position());
 
     // then a 1
-    assert_eq!(1, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (num1, bytes1) = varint_read(&mut cursor).unwrap();
+    assert_eq!(1, zig_zag_decode(num1));
+    assert_eq!(1, bytes1);
     assert_eq!(3, cursor.position());
 }
 
@@ -199,7 +205,9 @@ fn encode_counts_first_count_incremented() {
 
     let mut cursor = Cursor::new(vec);
     // zero position has a 1
-    assert_eq!(1, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (decoded, bytes_read) = varint_read(&mut cursor).unwrap();
+    assert_eq!(1, zig_zag_decode(decoded));
+    assert_eq!(1, bytes_read);
     assert_eq!(1, cursor.position());
 
     // max is 1, so rest isn't set
@@ -224,14 +232,20 @@ fn encode_counts_first_and_last_count_incremented() {
 
     let mut cursor = Cursor::new(vec);
     // zero position has a 1
-    assert_eq!(1, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (num0, bytes0) = varint_read(&mut cursor).unwrap();
+    assert_eq!(1, zig_zag_decode(num0));
+    assert_eq!(1, bytes0);
     assert_eq!(1, cursor.position());
 
     // 2046 zeroes, then a 1.
-    assert_eq!(-2046, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (num1, bytes1) = varint_read(&mut cursor).unwrap();
+    assert_eq!(-2046, zig_zag_decode(num1));
+    assert_eq!(2, bytes1);
     assert_eq!(3, cursor.position());
 
-    assert_eq!(1, zig_zag_decode(varint_read(&mut cursor).unwrap()));
+    let (num2, bytes2) = varint_read(&mut cursor).unwrap();
+    assert_eq!(1, zig_zag_decode(num2));
+    assert_eq!(1, bytes2);
     assert_eq!(4, cursor.position());
 }
 
@@ -282,13 +296,17 @@ fn varint_write_u64_max() {
 #[test]
 fn varint_read_u64_max() {
     let input = &mut Cursor::new(vec![0xFF; 9]);
-    assert_eq!(u64::max_value(), varint_read(input).unwrap());
+    let (num, bytes) = varint_read(input).unwrap();
+    assert_eq!(u64::max_value(), num);
+    assert_eq!(9, bytes);
 }
 
 #[test]
 fn varint_read_u64_zero() {
     let input = &mut Cursor::new(vec![0x00; 9]);
-    assert_eq!(0, varint_read(input).unwrap());
+    let (num, bytes) = varint_read(input).unwrap();
+    assert_eq!(0, num);
+    assert_eq!(1, bytes);
 }
 
 #[test]
@@ -395,7 +413,9 @@ fn do_varint_write_read_roundtrip_rand(length: usize) {
         let r: u64 = range.ind_sample(&mut rng);
         let bytes_written = varint_write(r, &mut buf);
         assert_eq!(length, bytes_written);
-        assert_eq!(r, varint_read(&mut &buf[..bytes_written]).unwrap());
+        let (decoded, bytes_read) = varint_read(&mut &buf[..bytes_written]).unwrap();
+        assert_eq!(r, decoded);
+        assert_eq!(bytes_written, bytes_read as usize);
 
         // make sure the other bytes are all still 0
         assert_eq!(vec![0; 9 - bytes_written], &buf[bytes_written..]);

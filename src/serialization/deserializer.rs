@@ -1,7 +1,7 @@
 use super::V2_COOKIE;
 use super::super::{Counter, Histogram};
 use super::super::num::ToPrimitive;
-use std::io::{self, Cursor, ErrorKind, Read};
+use std::io::{self, ErrorKind, Read};
 use std;
 use super::byteorder::{BigEndian, ReadBytesExt};
 
@@ -37,14 +37,12 @@ impl std::convert::From<std::io::Error> for DeserializeError {
 /// Since the serialization formats all include some magic bytes that allow reliable identification
 /// of the different formats, only one Deserializer implementation is needed.
 pub struct Deserializer {
-    payload_buf: Vec<u8>
 }
 
 impl Deserializer {
     /// Create a new deserializer.
     pub fn new() -> Deserializer {
         Deserializer {
-            payload_buf: Vec::new()
         }
     }
 
@@ -62,8 +60,7 @@ impl Deserializer {
             return Err(DeserializeError::InvalidCookie);
         }
 
-        let payload_len = reader.read_u32::<BigEndian>()?.to_usize()
-            .ok_or(DeserializeError::UsizeTypeTooSmall)?;
+        let payload_len = reader.read_u32::<BigEndian>()?;
         let normalizing_offset = reader.read_u32::<BigEndian>()?;
         if normalizing_offset != 0 {
             return Err(DeserializeError::UnsupportedFeature);
@@ -80,17 +77,13 @@ impl Deserializer {
         let mut h = Histogram::new_with_bounds(low, high, num_digits)
             .map_err(|_| DeserializeError::InvalidParameters)?;
 
-        if payload_len > self.payload_buf.len() {
-            self.payload_buf.resize(payload_len, 0);
-        }
-
-        let mut payload_slice = &mut self.payload_buf[0..payload_len];
-        reader.read_exact(&mut payload_slice)?;
-
-        let mut cursor = Cursor::new(&payload_slice);
+        let mut payload_reader = reader.take(payload_len as u64);
         let mut dest_index: usize = 0;
-        while cursor.position() < payload_slice.len() as u64 {
-            let num = zig_zag_decode(varint_read(&mut cursor)?);
+        let mut payload_bytes_read = 0;
+        while payload_bytes_read < payload_len {
+            let (decoded, bytes_read) = varint_read(&mut payload_reader)?;
+            payload_bytes_read += bytes_read as u32;
+            let num = zig_zag_decode(decoded);
 
             if num < 0 {
                 let zero_count = (-num).to_usize()
@@ -120,37 +113,47 @@ impl Deserializer {
 }
 
 // Only public for testing.
-/// Read a LEB128-64b9B from the buffer
-pub fn varint_read<R: Read>(reader: &mut R) -> io::Result<u64> {
+/// Read a LEB128-64b9B from the buffer.
+/// Returns a tuple of (decuded u64, number of bytes consumed).
+pub fn varint_read<R: Read>(reader: &mut R) -> io::Result<(u64, u8)> {
     let mut b = reader.read_u8()?;
 
     // take low 7 bits
     let mut value: u64 = low_7_bits(b);
+    let mut bytes_read: u8 = 1;
 
     if is_high_bit_set(b) {
         // high bit set, keep reading
         b = reader.read_u8()?;
+        bytes_read += 1;
         value |= low_7_bits(b) << 7;
         if is_high_bit_set(b) {
             b = reader.read_u8()?;
+            bytes_read += 1;
             value |= low_7_bits(b) << 7 * 2;
             if is_high_bit_set(b) {
                 b = reader.read_u8()?;
+                bytes_read += 1;
                 value |= low_7_bits(b) << 7 * 3;
                 if is_high_bit_set(b) {
                     b = reader.read_u8()?;
+                    bytes_read += 1;
                     value |= low_7_bits(b) << 7 * 4;
                     if is_high_bit_set(b) {
                         b = reader.read_u8()?;
+                        bytes_read += 1;
                         value |= low_7_bits(b) << 7 * 5;
                         if is_high_bit_set(b) {
                             b = reader.read_u8()?;
+                            bytes_read += 1;
                             value |= low_7_bits(b) << 7 * 6;
                             if is_high_bit_set(b) {
                                 b = reader.read_u8()?;
+                                bytes_read += 1;
                                 value |= low_7_bits(b) << 7 * 7;
                                 if is_high_bit_set(b) {
                                     b = reader.read_u8()?;
+                                    bytes_read += 1;
                                     // special case: use last byte as is
                                     value |= (b as u64) << 7 * 8;
                                 }
@@ -162,7 +165,7 @@ pub fn varint_read<R: Read>(reader: &mut R) -> io::Result<u64> {
         }
     }
 
-    Ok(value)
+    Ok((value, bytes_read))
 }
 
 /// truncate byte to low 7 bits, cast to u64
