@@ -6,6 +6,11 @@ use std::marker::PhantomData;
 use std;
 use super::byteorder::{BigEndian, ReadBytesExt};
 
+// Read payload in chunks. The number doesn't seem to make a major difference, so we'll just pick
+// the default page table entry size since that will fit certainly in L1 and also a 16-bit usize.
+const PAYLOAD_CHUNK_LEN: usize = 4096;
+const VARINT_MAX_LEN: usize = 9;
+
 /// Errors that can happen during deserialization.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DeserializeError {
@@ -44,9 +49,13 @@ pub struct Deserializer {
 impl Deserializer {
     /// Create a new deserializer.
     pub fn new() -> Deserializer {
-        Deserializer {
-            payload_buf: Vec::new()
-        }
+        let mut d = Deserializer {
+            payload_buf: Vec::with_capacity(PAYLOAD_CHUNK_LEN)
+        };
+
+        d.payload_buf.resize(PAYLOAD_CHUNK_LEN, 0);
+
+        d
     }
 
     /// Deserialize an encoded histogram from the provided reader.
@@ -61,8 +70,7 @@ impl Deserializer {
             return Err(DeserializeError::InvalidCookie);
         }
 
-        let payload_len = reader.read_u32::<BigEndian>()?.to_usize()
-            .ok_or(DeserializeError::UsizeTypeTooSmall)?;
+        let payload_len = reader.read_u32::<BigEndian>()?;
         let normalizing_offset = reader.read_u32::<BigEndian>()?;
         if normalizing_offset != 0 {
             return Err(DeserializeError::UnsupportedFeature);
@@ -79,36 +87,88 @@ impl Deserializer {
         let mut h = Histogram::new_with_bounds(low, high, num_digits)
             .map_err(|_| DeserializeError::InvalidParameters)?;
 
-        if payload_len > self.payload_buf.len() {
-            self.payload_buf.resize(payload_len, 0);
-        }
-
-        let mut payload_slice = &mut self.payload_buf[0..payload_len];
-        reader.read_exact(&mut payload_slice)?;
-
-        let mut payload_index: usize = 0;
+        let mut bytes_read_in_chunk: usize = 0;
         let mut restat_state = RestatState::new();
         let mut decode_state = DecodeLoopState::new();
+        // how many un-processed bytes were copied from the end of the previous chunk to this one
+        let mut chunk_leftover_len: usize = 0;
+        // How many bytes have been read and deserialized in all previous chunks.
+        // May exceed usize type, but we don't allocate a contiguous array this big.
+        let mut total_payload_bytes_deserialized: u32 = 0;
 
-        while payload_index < payload_len.saturating_sub(9) {
-            // Read with fast loop until we are within 9 of the end. Fast loop can't handle EOF,
-            // so bail to slow version for the last few bytes.
+        {
+            let mut payload_chunk = &mut self.payload_buf[0..PAYLOAD_CHUNK_LEN];
+            // Cast is safe: chunk length is much lower than u32 max.
+            let first_invalid_chunk_start = payload_len.saturating_sub(PAYLOAD_CHUNK_LEN as u32);
+            // There will be some carryover from the previous chunk, so the loop can't just be as
+            // many chunks as would fit perfectly into payload_len.
+            // Subtract off chunk_leftover_len because we will need to read that many fewer bytes
+            // than a full chunk. Subtraction is safe because either it's the first iteration and
+            // chunk_leftover_len is 0 or it's a subsequent iteration and total is at least
+            // min_varints_per_chunk. Cast is safe because chunk_leftover_len is in [0, 8].
+            while total_payload_bytes_deserialized - (chunk_leftover_len as u32) < first_invalid_chunk_start {
+                // read into the slice, starting just after the leftover bytes from previous chunk
+                reader.read_exact(&mut payload_chunk[chunk_leftover_len..])?;
 
-            let (zz_num, bytes_read) = varint_read_slice(
-                &payload_slice[payload_index..(payload_index + 9)]);
-            payload_index += bytes_read;
+                while bytes_read_in_chunk <= PAYLOAD_CHUNK_LEN - VARINT_MAX_LEN {
+                    let (zz_num, bytes_read) = varint_read_slice(
+                        &payload_chunk[bytes_read_in_chunk..(bytes_read_in_chunk + VARINT_MAX_LEN)]);
+                    bytes_read_in_chunk += bytes_read;
 
-            let count_or_zeros = zig_zag_decode(zz_num);
+                    let count_or_zeros = zig_zag_decode(zz_num);
+                    decode_state.on_decoded_num(count_or_zeros, &mut restat_state, &mut h)?;
+                };
 
-            decode_state.on_decoded_num(count_or_zeros, &mut restat_state, &mut h)?;
+                // The next deserialize would have gone out of bounds
+                debug_assert!(bytes_read_in_chunk + VARINT_MAX_LEN > PAYLOAD_CHUNK_LEN);
+
+                // VARINT_MAX_LEN or fewer bytes left over; copy them to the beginning.
+                chunk_leftover_len = PAYLOAD_CHUNK_LEN.checked_sub(bytes_read_in_chunk)
+                    .expect("Read more bytes in the chunk than the chunk length?");
+                debug_assert!(chunk_leftover_len <= 8);
+                // No risk of reading what we write because we're at opposite ends of a much larger
+                // (PAYLOAD_CHUNK_LEN) slice.
+                for i in 0..chunk_leftover_len {
+                    payload_chunk[i] = payload_chunk[bytes_read_in_chunk + i];
+                };
+
+                // Cast is safe, PAYLOAD_CHUNK_LEN is much lower than u32 max
+                total_payload_bytes_deserialized += bytes_read_in_chunk as u32;
+                bytes_read_in_chunk = 0;
+            };
+        };
+
+        // Read the last partial chunk. Cast is safe: chunk_leftover_len in [0, 8].
+        let bytes_read = total_payload_bytes_deserialized + chunk_leftover_len as u32;
+        let bytes_to_read_last_chunk = (payload_len - bytes_read).to_usize()
+            .expect("Chunk calculation error: too many bytes to read for last chunk");
+        assert!(bytes_to_read_last_chunk < PAYLOAD_CHUNK_LEN,
+            "Chunk calculation error: last chunk too big");
+        // This is always at least chunk_leftover_len
+        let last_chunk_len = chunk_leftover_len.checked_add(bytes_to_read_last_chunk)
+            .expect("Last chunk too big");
+
+        {
+            let mut last_read_slice = &mut self.payload_buf[chunk_leftover_len..last_chunk_len];
+            reader.read_exact(&mut last_read_slice)?;
         }
 
-        // Now read the leftovers
-        let leftover_slice = &payload_slice[payload_index..];
-        let mut cursor = Cursor::new(&leftover_slice);
-        while cursor.position() < leftover_slice.len() as u64 {
-            let count_or_zeros = zig_zag_decode(varint_read(&mut cursor)?);
+        let last_chunk = &mut self.payload_buf[0..last_chunk_len];
 
+        while bytes_read_in_chunk < last_chunk_len.saturating_sub(VARINT_MAX_LEN) {
+            let (zz_num, bytes_read) = varint_read_slice(
+                &last_chunk[bytes_read_in_chunk..(bytes_read_in_chunk + VARINT_MAX_LEN)]);
+            bytes_read_in_chunk += bytes_read;
+
+            let count_or_zeros = zig_zag_decode(zz_num);
+            decode_state.on_decoded_num(count_or_zeros, &mut restat_state, &mut h)?;
+        };
+
+        // Read the last few bytes with a slower, EOF-capable varint function
+        let slow_loop_slice = &last_chunk[bytes_read_in_chunk..];
+        let mut cursor = Cursor::new(&slow_loop_slice);
+        while cursor.position() < slow_loop_slice.len() as u64 {
+            let count_or_zeros = zig_zag_decode(varint_read(&mut cursor)?);
             decode_state.on_decoded_num(count_or_zeros, &mut restat_state, &mut h)?;
         }
 
